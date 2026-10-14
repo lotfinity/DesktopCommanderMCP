@@ -1,0 +1,37 @@
+import {test} from 'node:test';
+import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import {start} from '../server.mjs';
+
+test('OAuth discovery, consent, PKCE, audience binding, single use, refresh rotation and revocation',async t=>{
+ const dir=await fs.mkdtemp(path.join(os.tmpdir(),'fleet-oauth-'));
+ const base='https://fleet.example',f=await start({port:0,dir,base}),url='http://127.0.0.1:'+f.address.port;
+ t.after(async()=>{await f.close();await fs.rm(dir,{recursive:true,force:true});});
+ const resource=await (await fetch(url+'/.well-known/oauth-protected-resource/mcp')).json();assert.equal(resource.resource,base+'/mcp');
+ const metadata=await (await fetch(url+'/.well-known/oauth-authorization-server')).json();assert.deepEqual(metadata.code_challenge_methods_supported,['S256']);
+ const challenge401=await fetch(url+'/mcp',{method:'POST'});assert.equal(challenge401.status,401);assert.match(challenge401.headers.get('www-authenticate'),/resource_metadata/);
+ const post=async(route,body,owner=false)=>{const r=await fetch(url+route,{method:'POST',headers:{'content-type':'application/json',...(owner?{authorization:'Bearer '+f.store.adminKey}:{})},body:JSON.stringify(body)});return {status:r.status,body:await r.json()};};
+ assert.equal((await post('/oauth/register',{redirect_uris:['http://evil.example/callback']})).status,400);
+ const registration=await post('/oauth/register',{client_name:'Test client',redirect_uris:['https://client.example/callback'],token_endpoint_auth_method:'none'});assert.equal(registration.status,201);
+ const client=registration.body,verifier=crypto.randomBytes(32).toString('base64url'),challenge=crypto.createHash('sha256').update(verifier).digest('base64url');
+ const query={client_id:client.client_id,redirect_uri:client.redirect_uris[0],response_type:'code',resource:base+'/mcp',code_challenge:challenge,code_challenge_method:'S256',state:'original-state'};
+ assert.throws(()=>f.oauth.authorize({...query,redirect_uri:'https://different.example/callback'}),/redirect/);
+ assert.throws(()=>f.oauth.authorize({...query,resource:'https://other.example/mcp'}),/resource/);
+ assert.throws(()=>f.oauth.authorize({...query,code_challenge_method:'plain'}),/PKCE/);
+ const auth=await fetch(url+'/oauth/authorize?'+new URLSearchParams(query),{redirect:'manual'});assert.equal(auth.status,302);const requestId=new URL(auth.headers.get('location'),url).searchParams.get('authorize');
+ assert.equal((await post('/api/oauth/requests/'+requestId,{allow:true,devices:null})).status,401);
+ const approval=await post('/api/oauth/requests/'+requestId,{allow:true,devices:null},true);assert.equal(approval.status,200);const callback=new URL(approval.body.redirect);assert.equal(callback.origin,'https://client.example');assert.equal(callback.searchParams.get('state'),'original-state');
+ const body={grant_type:'authorization_code',client_id:client.client_id,redirect_uri:client.redirect_uris[0],resource:base+'/mcp',code:callback.searchParams.get('code'),code_verifier:verifier};
+ assert.equal((await post('/oauth/token',{...body,code_verifier:'x'.repeat(43)})).status,400);
+ assert.equal((await post('/oauth/token',{...body,resource:'https://other.example/mcp'})).status,400);
+ const tokens=await post('/oauth/token',body);assert.equal(tokens.status,200);assert(f.oauth.principal(tokens.body.access_token));assert.equal((await post('/oauth/token',body)).status,400);
+ const refresh={grant_type:'refresh_token',client_id:client.client_id,resource:base+'/mcp',refresh_token:tokens.body.refresh_token};
+ const next=await post('/oauth/token',refresh);assert.equal(next.status,200);assert.equal(f.oauth.principal(tokens.body.access_token),null);assert.equal((await post('/oauth/token',refresh)).status,400);
+ assert(f.oauth.principal(next.body.access_token));const grant=f.oauth.grants()[0];f.store.data.oauthGrants[grant.id].accessExpires=0;assert.equal(f.oauth.principal(next.body.access_token),null);
+ f.store.data.oauthGrants[grant.id].revoked=true;assert.equal((await post('/oauth/token',{...refresh,refresh_token:next.body.refresh_token})).status,400);
+ const denied=f.oauth.authorize(query);assert.equal(new URL(f.oauth.approve(denied,null,false)).searchParams.get('error'),'access_denied');
+ assert(!JSON.stringify(f.store.data).includes(next.body.access_token));assert(!JSON.stringify(f.store.data).includes(next.body.refresh_token));
+});

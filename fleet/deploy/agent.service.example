@@ -1,0 +1,14 @@
+[Unit]
+Description=Synaptic Fleet device agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/node /path/to/DesktopCommanderMCP/fleet/agent.mjs
+Restart=on-failure
+RestartSec=5
+UMask=0077
+
+[Install]
+WantedBy=default.target

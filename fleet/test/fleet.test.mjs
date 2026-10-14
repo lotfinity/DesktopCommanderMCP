@@ -1,0 +1,57 @@
+import {test} from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import WebSocket from 'ws';
+import {Client} from '@modelcontextprotocol/sdk/client/index.js';
+import {StreamableHTTPClientTransport} from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import {start} from '../server.mjs';
+import {Store} from '../state.mjs';
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+async function until(fn){for(let i=0;i<100;i++){if(fn())return;await sleep(20);}throw Error('Condition not reached');}
+
+test('multi-device routing, credentials, persistence, revocation and no replay',async t=>{
+ const dir=await fs.mkdtemp(path.join(os.tmpdir(),'fleet-test-'));
+ const f=await start({port:0,dir}),url='http://127.0.0.1:'+f.address.port;
+ t.after(async()=>{await f.close();await fs.rm(dir,{recursive:true,force:true});});
+ const api=async(route,body,token=f.store.adminKey,method=body?'POST':'GET')=>{const r=await fetch(url+route,{method,headers:{authorization:'Bearer '+token,'content-type':'application/json'},...(body?{body:JSON.stringify(body)}:{})});return {status:r.status,body:await r.json()};};
+ assert.equal((await api('/api/status',null,'wrong')).status,401);
+ assert.equal((await api('/mcp',{jsonrpc:'2.0',id:1,method:'tools/list'},'wrong')).status,401);
+ const login=await api('/api/login-links',{}),ticket=new URL(login.body.url,url).hash.slice('#ticket='.length);
+ const session=await api('/auth/redeem',{ticket},'wrong');assert.equal(session.status,200);
+ assert.equal((await api('/auth/redeem',{ticket},'wrong')).status,403);
+ assert.equal((await api('/api/status',null,session.body.token)).status,200);
+ await api('/api/logout',{},session.body.token);
+ assert.equal((await api('/api/status',null,session.body.token)).status,401);
+ const p1=f.store.enrollment('First'),p2=f.store.enrollment('Second');
+ const a=f.store.enroll(p1.code,{hostname:'host-a',platform:'linux'}),b=f.store.enroll(p2.code,{hostname:'host-b',platform:'win32'});
+ assert.throws(()=>f.store.enroll(p1.code,{}),/expired/);
+ const expired=f.store.enrollment('Expired');f.store.data.enrollments[Object.keys(f.store.data.enrollments).find(k=>f.store.data.enrollments[k].name==='Expired')].expiresAt=0;
+ assert.throws(()=>f.store.enroll(expired.code,{}),/expired/);
+ const counts={};const sockets=[];
+ function connect(device,marker){const ws=new WebSocket(url.replace('http:','ws:')+'/agent/connect?deviceId='+device.deviceId,{headers:{authorization:'Bearer '+device.token}});sockets.push(ws);ws.on('open',()=>ws.send(JSON.stringify({type:'hello',tools:[{name:'echo',description:'Echo marker',inputSchema:{type:'object',properties:{value:{type:'string'}},required:['value']}}]})));ws.on('message',raw=>{const m=JSON.parse(raw);if(m.type!=='call')return;counts[marker]=(counts[marker]||0)+1;if(m.arguments.value==='hang')return;ws.send(JSON.stringify({type:'result',id:m.id,result:{content:[{type:'text',text:marker+':'+m.arguments.value}]}}));});return ws;}
+ t.after(()=>sockets.forEach(s=>s.terminate()));
+ const wa=connect(a,'A'),wb=connect(b,'B');await until(()=>f.router.links.get(a.deviceId)?.ready&&f.router.links.get(b.deviceId)?.ready);
+ const [ra,rb]=await Promise.all([f.router.call({id:'owner',admin:true},a.deviceId,'echo',{value:'one'}),f.router.call({id:'owner',admin:true},b.deviceId,'echo',{value:'two'})]);
+ assert.equal(ra.content[0].text,'A:one');assert.equal(rb.content[0].text,'B:two');
+ const key=f.store.key('Only first',[a.deviceId]);
+ assert.equal((await api('/api/status',null,key.token)).body.devices.length,1);
+ assert.equal((await api('/api/devices/'+b.deviceId+'/call',{tool:'echo',arguments:{value:'forbidden'}},key.token)).status,400);
+ assert.equal((await api('/api/keys',null,key.token)).status,403);
+ const client=new Client({name:'test',version:'1'},{capabilities:{}});
+ await client.connect(new StreamableHTTPClientTransport(new URL(url+'/mcp'),{requestInit:{headers:{authorization:'Bearer '+key.token}}}));
+ const tools=await client.listTools();assert(tools.tools.some(t=>t.name==='dc_echo'&&t.inputSchema.required.includes('deviceId')));
+ const result=await client.callTool({name:'dc_echo',arguments:{deviceId:a.deviceId,value:'MCP'}});assert.equal(result.content[0].text,'A:MCP');
+ const denied=await client.callTool({name:'dc_echo',arguments:{deviceId:b.deviceId,value:'wrong'}});assert.equal(denied.isError,true);
+ const concurrent=await Promise.all(Array.from({length:5},(_,i)=>f.router.call({id:'owner',admin:true},a.deviceId,'echo',{value:String(i)})));assert.deepEqual(concurrent.map(x=>x.content[0].text),['A:0','A:1','A:2','A:3','A:4']);
+ const timeout=f.router.call({id:'owner',admin:true},a.deviceId,'echo',{value:'hang'},100);await assert.rejects(timeout,/timed out/);assert.equal(f.router.pending.size,0);
+ const pending=f.router.call({id:'owner',admin:true},b.deviceId,'echo',{value:'hang'});const rejects=assert.rejects(pending,/disconnected/);await sleep(30);wb.close();await rejects;
+ assert(!f.router.devices({admin:true}).find(d=>d.id===b.deviceId).online);
+ const countB=counts.B;connect(b,'B');await until(()=>f.router.links.get(b.deviceId)?.ready);await sleep(50);assert.equal(counts.B,countB);
+ f.router.revoke(a.deviceId);assert.equal(f.store.deviceAuth(a.deviceId,a.token),null);await until(()=>!f.router.links.has(a.deviceId));
+ f.store.data.keys[key.id].revoked=true;f.store.save();assert.equal((await api('/api/status',null,key.token)).status,401);
+ await client.close();const restored=new Store(dir);assert.equal(restored.publicDevices().length,2);assert.equal(restored.data.devices[a.deviceId].revoked,true);assert(restored.data.events.length>0);
+ assert(!JSON.stringify(restored.data).includes(a.token));assert(!JSON.stringify(restored.data.events).includes('forbidden'));
+ assert.equal(wa.readyState,WebSocket.CLOSED);
+});

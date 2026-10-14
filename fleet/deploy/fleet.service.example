@@ -1,0 +1,17 @@
+[Unit]
+Description=Synaptic Fleet central gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/path/to/DesktopCommanderMCP/fleet
+ExecStart=/usr/bin/node /path/to/DesktopCommanderMCP/fleet/server.mjs
+Environment=FLEET_PORT=8800
+Environment=FLEET_PUBLIC_URL=https://your-host.example
+Restart=on-failure
+RestartSec=5
+UMask=0077
+
+[Install]
+WantedBy=default.target
