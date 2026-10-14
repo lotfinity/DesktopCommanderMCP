@@ -27,7 +27,7 @@ For private Tailscale access, expose this port with Tailscale Serve. For a conta
 
 ## Agent
 
-From this directory on Linux or Windows, install the fleet dependencies and the local backend:
+Clone the feature branch with `git clone --branch feature/self-hosted-fleet https://github.com/lotfinity/DesktopCommanderMCP.git`, then enter `DesktopCommanderMCP/fleet`. On Linux or Windows, install the fleet dependencies and the local backend:
 
 ```sh
 npm ci
